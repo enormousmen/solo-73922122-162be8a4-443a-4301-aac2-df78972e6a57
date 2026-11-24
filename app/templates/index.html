@@ -78,6 +78,7 @@
         <option value="order_items">order_items 明细表</option>
       </select>
       <button onclick="openTx()">打开并保持读事务</button>
+      <button class="secondary" onclick="closeAllTx()">全部结束（释放全部锁）</button>
     </div>
     <p class="muted" style="margin:8px 0">事务不提交也不回滚，直到值班员手动结束。</p>
     <table>
@@ -141,14 +142,30 @@
   </section>
 
   <section class="card">
-    <h2>⑤ 服务器端锁队列实况（pg_locks）</h2>
+    <h2>⑤ 锁队列采样实况（多窗口共享 · pg_locks）</h2>
+    <div class="row" style="justify-content:space-between; margin-bottom:8px">
+      <div class="row">
+        <span id="sampleStatus" class="badge b-idle">采样状态未知</span>
+        <span id="sampleInFlight" class="pill" style="display:none">采样中…</span>
+      </div>
+      <span class="muted" id="sampleCount">实际采样次数 0</span>
+    </div>
+    <div class="kv" style="grid-template-columns:96px 1fr 96px 1fr; margin-bottom:8px">
+      <b>上次开始</b><span id="sampleStarted">-</span>
+      <b>上次成功</b><span id="sampleSuccess">-</span>
+      <b>成功/失败</b><span id="sampleOkFail">-</span>
+      <b>迟到丢弃</b><span id="sampleDiscarded">0</span>
+    </div>
+    <p id="sampleNotice" class="hint" style="display:none; margin:0 0 10px"></p>
     <table>
-      <thead><tr><th>表</th><th>锁模式</th><th>已授予</th><th>会话状态</th><th>SQL</th></tr></thead>
-      <tbody id="lockBody"><tr><td colspan="5" class="muted">无</td></tr></tbody>
+      <thead><tr><th>表</th><th>PID</th><th>用户/来源</th><th>锁模式</th><th>已授予</th><th>会话状态</th><th>SQL</th></tr></thead>
+      <tbody id="lockBody"><tr><td colspan="7" class="muted">无</td></tr></tbody>
     </table>
     <p class="muted" style="margin:8px 0 0">
-      等锁期间这里只应看到演示事务的已授予锁，不应出现 granted=false 的
-      ALTER 排队记录——这正是普通读写不被堵住的原因。
+      单个 Web 进程内只有一个共享采样器：所有窗口共用同一份结果，
+      两轮采样开始至少相隔 1 秒、上一轮未结束不并发新采样；查状态接口
+      不会等待采样。外部连接（如 psql）持续持有的 orders / order_items
+      锁也会显示在这里。等锁期间不应出现 granted=false 的 ALTER 排队记录。
     </p>
   </section>
 
@@ -201,6 +218,15 @@ async function openTx() {
 async function closeTx(token) {
   try { await post("/api/demo-tx/close", {token}); }
   catch (e) { alert(e.message); }
+  refresh();
+}
+async function closeAllTx() {
+  const tokens = (window.__heldTokens || []).slice();
+  if (!tokens.length) { alert("当前没有打开的演示事务"); return; }
+  for (const token of tokens) {
+    try { await post("/api/demo-tx/close", {token}); }
+    catch (e) { /* 单个失败不阻断其余关闭 */ }
+  }
   refresh();
 }
 async function submitMigration() {
@@ -274,6 +300,7 @@ function renderState(s) {
       m.state === "waiting" || m.state === "running";
 
   const txBody = document.getElementById("txBody");
+  window.__heldTokens = s.held_transactions.map(t => t.token);
   if (!s.held_transactions.length) {
     txBody.innerHTML = '<tr><td colspan="5" class="muted">暂无打开的演示事务</td></tr>';
   } else {
@@ -293,14 +320,83 @@ function renderState(s) {
         ? "batch_no VARCHAR(64)，可空"
         : "等待迁移在同一事务中添加 batch_no VARCHAR(64)"}</td></tr>`).join("");
 
-  const lockBody = document.getElementById("lockBody");
-  if (!s.server_lock_queue.length) {
-    lockBody.innerHTML = '<tr><td colspan="5" class="muted">无</td></tr>';
+  // ---- 共享锁采样状态 ----
+  const samp = s.lock_sampler || s.sampler || s;
+  const statusEl = document.getElementById("sampleStatus");
+  const badgeClass = {
+    fresh: "b-succeeded", pending: "b-waiting", stale: "b-failed",
+    error: "b-failed", loading: "b-idle",
+  }[samp.status] || "b-idle";
+  statusEl.className = "badge " + badgeClass;
+  statusEl.textContent = "采样状态：" + (samp.status_label || samp.status);
+  document.getElementById("sampleInFlight").style.display =
+      samp.in_flight ? "inline-block" : "none";
+  document.getElementById("sampleCount").textContent =
+      "实际采样次数 " + samp.sample_count
+      + "（成功 " + samp.success_count + " / 失败 " + samp.failure_count + "）";
+  document.getElementById("sampleStarted").textContent = samp.last_started_at || "-";
+  document.getElementById("sampleSuccess").textContent = samp.last_success_at || "-";
+  document.getElementById("sampleOkFail").textContent =
+      samp.success_count + " / " + samp.failure_count;
+  document.getElementById("sampleDiscarded").textContent = samp.discarded_count;
+
+  const notice = document.getElementById("sampleNotice");
+  if (samp.pending_update && samp.expired) {
+    notice.style.display = "block";
+    notice.style.background = "#fee2e2";
+    notice.style.borderColor = "#fca5a5";
+    notice.style.color = "var(--red)";
+    notice.textContent = "列表待更新且最近采样失败：以下是上次成功的旧列表（已过期）。"
+      + "操作前出发的迟到采样不会刷新它；操作后的采样成功后自动恢复。"
+      + (samp.last_error ? " 错误：" + samp.last_error : "");
+  } else if (samp.pending_update) {
+    notice.style.display = "block";
+    notice.style.background = "#fffbeb";
+    notice.style.borderColor = "#fde68a";
+    notice.style.color = "#92400e";
+    notice.textContent = "列表待更新：演示读事务刚打开/结束，当前仍是操作前的旧采样；"
+      + "只有操作之后启动的采样才能刷新列表（两轮采样开始至少相隔 1 秒）。";
+  } else if (samp.expired || samp.status === "stale") {
+    notice.style.display = "block";
+    notice.style.background = "#fee2e2";
+    notice.style.borderColor = "#fca5a5";
+    notice.style.color = "var(--red)";
+    notice.textContent = "采样失败，以下保留的是上次成功的列表（已过期）；"
+      + "后续采样成功后会自动恢复为最新。"
+      + (samp.last_error ? " 错误：" + samp.last_error : "");
+  } else if (samp.status === "error") {
+    notice.style.display = "block";
+    notice.style.background = "#fee2e2";
+    notice.style.borderColor = "#fca5a5";
+    notice.style.color = "var(--red)";
+    notice.textContent = "采样失败且暂无成功列表：" + (samp.last_error || "未知错误");
   } else {
-    lockBody.innerHTML = s.server_lock_queue.map(l => `
-      <tr><td>${esc(l.table_name)}</td><td>${esc(l.mode)}</td>
+    notice.style.display = "none";
+  }
+
+  const demoPids = new Set((s.held_transactions || []).map(t => t.pid));
+  const lockBody = document.getElementById("lockBody");
+  const lockRows = s.server_lock_queue || samp.locks || [];
+  lockBody.style.opacity = (samp.pending_update || samp.expired) ? "0.65" : "1";
+  if (!lockRows.length) {
+    const emptyText = samp.status === "loading" ? "首次采样中…"
+      : (samp.status === "error" ? "采样失败，暂无列表" : "两张表当前无锁记录");
+    lockBody.innerHTML = `<tr><td colspan="7" class="muted">${emptyText}</td></tr>`;
+  } else {
+    lockBody.innerHTML = lockRows.map(l => {
+      const who = demoPids.has(l.pid)
+        ? '<span class="pill" style="background:#fef3c7;color:#92400e">本页演示事务</span>'
+        : '<span class="pill" style="background:#dcfce7;color:#15803d">外部/其他会话</span>';
+      const source = [l.usename, l.client_addr, l.application_name]
+        .filter(x => x !== null && x !== undefined && x !== "").map(esc).join(" · ");
+      return `
+      <tr><td>${esc(l.table_name)}</td>
+      <td>${l.pid ?? ""} ${who}</td>
+      <td class="muted">${source || "-"}</td>
+      <td>${esc(l.mode)}</td>
       <td>${l.granted ? "是" : '<b style="color:var(--red)">否（排队中）</b>'}</td>
-      <td>${esc(l.state)}</td><td class="muted">${esc(l.query)}</td></tr>`).join("");
+      <td>${esc(l.state)}</td><td class="muted">${esc(l.query)}</td></tr>`;
+    }).join("");
   }
 
   document.getElementById("eventLog").textContent =
